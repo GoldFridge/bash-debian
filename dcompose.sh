@@ -1,125 +1,118 @@
 #!/bin/bash
 
-# 1. Создание структуры директорий
-echo "1. Creating directory structure..."
-sudo mkdir -p /opt/docker/dockercompose/task-13
-cd /opt/docker/dockercompose || exit
+set -e
 
-# 2. Создание docker-compose.yml
-echo "2. Creating docker-compose.yml..."
-cat << 'EOF' > docker-compose.yml
+# 1. Подготовка
+mkdir -p /opt/docker/dockercompose/task-13
+cd /opt/docker/dockercompose
+
+# 2. Установка docker-compose (если ещё не установлен)
+if ! command -v docker-compose &> /dev/null; then
+    echo "Устанавливаем docker-compose..."
+    curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+    chmod +x /usr/local/bin/docker-compose
+fi
+
+# 3. Создание сети
+docker network create dockercompose-frontend || true
+
+# 4. Dockerfile для phpmyadmin (frontend)
+mkdir -p frontend
+cat > frontend/Dockerfile <<EOF
+FROM phpmyadmin:5.2.0-apache
+RUN apt-get update && apt-get install -y iputils-ping
+EOF
+
+# 5. Dockerfile для mariadb (mydb)
+mkdir -p mydb
+cat > mydb/Dockerfile <<EOF
+FROM mariadb:lts
+RUN apt-get update && apt-get install -y iputils-ping
+EOF
+
+# 6. docker-compose.yml
+cat > docker-compose.yml <<EOF
 version: '3.8'
 
 services:
-  frontend:
-    build:
-      context: .
-      dockerfile: Dockerfile.phpmyadmin
-    image: custom-phpmyadmin
-    container_name: phpmyadmin
-    ports:
-      - "8080:80"
-    networks:
-      - dockercompose-frontend
-    environment:
-      - PMA_HOST=mydb
-      - PMA_PORT=3306
-    depends_on:
-      mydb:
-        condition: service_healthy
-
   mydb:
-    build:
-      context: .
-      dockerfile: Dockerfile.mariadb
-    image: custom-mariadb
-    container_name: mariadb
+    build: ./mydb
+    container_name: mydb
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - mydb-data:/var/lib/mysql
     networks:
       - dockercompose-frontend
-    volumes:
-      - mysql_data:/var/lib/mysql
-    environment:
-      - MYSQL_ROOT_PASSWORD=rootpass
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpass"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
       interval: 10s
       timeout: 15s
       retries: 5
 
-networks:
-  dockercompose-frontend:
-    driver: bridge
+  frontend:
+    build: ./frontend
+    container_name: phpmyadmin
+    ports:
+      - "8080:80"
+    environment:
+      PMA_HOST: mydb
+      PMA_PORT: 3306
+    networks:
+      - dockercompose-frontend
+    depends_on:
+      mydb:
+        condition: service_healthy
 
 volumes:
-  mysql_data:
-    driver: local
-  backup_volume:
-    driver: local
+  mydb-data:
+
+networks:
+  dockercompose-frontend:
+    external: true
 EOF
 
-# 3. Создание Dockerfile для phpMyAdmin
-echo "3. Creating Dockerfile.phpmyadmin..."
-cat << 'EOF' > Dockerfile.phpmyadmin
-FROM phpmyadmin/phpmyadmin:5.2.0-apache
-RUN apt-get update && apt-get install -y iputils-ping && rm -rf /var/lib/apt/lists/*
-EOF
+# 7. Запуск сервисов
+docker-compose up -d --build
 
-# 4. Создание Dockerfile для MariaDB
-echo "4. Creating Dockerfile.mariadb..."
-cat << 'EOF' > Dockerfile.mariadb
-FROM mariadb:10.11
-RUN apt-get update && apt-get install -y iputils-ping && rm -rf /var/lib/apt/lists/*
-EOF
-
-# 5. Запуск сервисов
-echo "5. Starting services with docker-compose..."
-docker-compose up -d
-
-# 6. Проверка соединения между контейнерами
-echo "6. Testing network connectivity..."
-docker-compose exec frontend ping -c 3 mydb
-docker-compose exec mydb ping -c 3 frontend
-
-# 7. Проверка healthcheck (сломать и починить)
-echo "7. Testing healthcheck..."
-docker-compose exec mydb chmod 000 /var/lib/mysql
-sleep 10
-docker-compose ps
-docker-compose exec mydb chmod 755 /var/lib/mysql
-docker-compose restart mydb
-sleep 5
-docker-compose ps
-
-# 8. Создание базы данных и таблиц через phpMyAdmin (ожидание готовности MySQL)
-echo "8. Waiting for MySQL to be ready..."
-while ! docker-compose exec mydb mysqladmin ping -h localhost -u root -prootpass --silent; do
-    sleep 5
+# 8. Ожидаем готовность mydb
+echo "Ожидаем, пока mydb станет healthy..."
+while [[ "$(docker inspect --format='{{.State.Health.Status}}' mydb)" != "healthy" ]]; do
+  echo -n "."
+  sleep 3
 done
+echo "mydb готов!"
 
-echo "Creating database and tables..."
-docker-compose exec mydb mysql -u root -prootpass -e "
-CREATE DATABASE IF NOT EXISTS mydb;
-USE mydb;
-CREATE TABLE IF NOT EXISTS mytable (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  data TEXT,
-  datamodified TIMESTAMP DEFAULT NOW()
-);
-INSERT INTO mytable(data) VALUES('testdata01');
-INSERT INTO mytable(data) VALUES('testdata02');
-INSERT INTO mytable(data) VALUES('testdata03');
-"
+# 9. SQL-операции
+echo "Выполнение SQL-запросов..."
+docker exec -i phpmyadmin bash -c 'echo "
+create database mydb;
+use mydb;
+create table mytable ( id int AUTO_INCREMENT primary key, data text, datamodified timestamp default now());
+insert into mytable(data) values(\"testdata01\");
+insert into mytable(data) values(\"testdata02\");
+insert into mytable(data) values(\"testdata03\");
+" | php /etc/phpmyadmin/sql.php'
 
-# 9. Создание дампа базы данных
-echo "9. Creating database dump..."
-docker run --rm --volumes-from mariadb \
+# Альтернативно, напрямую через mysql клиент в phpmyadmin (если установлен):
+docker exec -i phpmyadmin bash -c 'apt-get update && apt-get install -y mariadb-client'
+docker exec -i phpmyadmin bash -c 'mysql -h mydb -uroot -proot <<EOF
+create database mydb;
+use mydb;
+create table mytable ( id int AUTO_INCREMENT primary key, data text, datamodified timestamp default now());
+insert into mytable(data) values("testdata01");
+insert into mytable(data) values("testdata02");
+insert into mytable(data) values("testdata03");
+EOF'
+
+# 10. Дамп базы
+echo "Создание дампа базы..."
+docker run --rm \
+  --network dockercompose-frontend \
   -v /opt/docker/dockercompose/task-13:/backup \
-  -v backup_volume:/tmp \
-  mariadb:10.11 \
-  bash -c 'mysqldump -h mydb -u root -prootpass --all-databases > /backup/mydb.sql'
+  -v mydb-data:/var/lib/mysql \
+  mariadb:lts \
+  bash -c "apt-get update && apt-get install -y mariadb-client && \
+  mysqldump -h mydb -uroot -proot mydb > /backup/mydb.sql"
 
-# 10. Проверка дампа
-echo "10. Verifying dump..."
-ls -lh /opt/docker/dockercompose/task-13/mydb.sql
-
-echo "Done! phpMyAdmin is available at http://localhost:8080 (login: root, password: rootpass)"
+echo "Готово. Выполните 'checkup-compose' в /opt/docker/dockercompose для проверки."
